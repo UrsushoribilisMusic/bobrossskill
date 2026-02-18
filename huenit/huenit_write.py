@@ -27,8 +27,16 @@ Z_UP = 3.0  # default, overridden by calibration
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "calibration.json")
+READY_FLAG = "/tmp/huenit_ready.flag"
 
 OK_PAT = re.compile(rb"\bok\b", re.I)
+
+
+def check_ready():
+    if not os.path.exists(READY_FLAG):
+        print("  ❌ Robot not calibrated this session.")
+        print("     Run:  python3 huenit_draw.py calibrate")
+        sys.exit(1)
 
 # ── Stroke Font ───────────────────────────────────────────────────────────────
 # Each letter is defined on a unit grid (0-1 width, 0-1 height).
@@ -168,6 +176,16 @@ def get_letter_width(ch):
     if ch == 'M' or ch == 'W':
         return 1.0
     return 0.9
+
+
+def calculate_text_width(text, size, spacing):
+    """Return total width of text string in mm."""
+    total = 0.0
+    for ch in text:
+        total += size * get_letter_width(ch.upper()) + spacing
+    if text:
+        total -= spacing  # no trailing spacing after last character
+    return total
 
 
 # ── Serial / G-code ──────────────────────────────────────────────────────────
@@ -335,7 +353,10 @@ def main():
     parser.add_argument("--spacing", type=float, default=2.0, help="Space between letters in mm (default 2)")
     parser.add_argument("--sound", type=str, default=None, help="MP3 to play before drawing")
     parser.add_argument("--feed", type=float, default=DEFAULT_DRAW_FEED, help="Draw feed rate mm/min (default 400)")
+    parser.add_argument("--line-spacing", type=float, default=1.5, help="Line height multiplier (default 1.5x letter height)")
     args = parser.parse_args()
+
+    check_ready()
 
     # Load calibration
     global Z_UP
@@ -347,7 +368,11 @@ def main():
     else:
         print(f"  📐 No calibration — using Z_UP = {Z_UP:.1f}mm")
 
-    print(f"HUENIT Write — '{args.text}' @ {args.size}mm | Port: {PORT}")
+    # Support \n in text (literal backslash-n or real newline)
+    lines = args.text.replace('\\n', '\n').split('\n')
+    line_height = args.size * args.line_spacing
+    preview = args.text.replace('\n', ' / ')
+    print(f"HUENIT Write — '{preview}' @ {args.size}mm | {len(lines)} line(s) | Port: {PORT}")
 
     # Play sound before starting
     if args.sound:
@@ -358,20 +383,45 @@ def main():
         g.send("G21", wait_ok=True)
         g.send("G91", wait_ok=True)
 
-        # Home pen to paper level.
-        # Slowly moves down by Z_UP — safe whether pen starts at paper (gentle press)
-        # or at travel height (returns it to paper after a previous run).
-        print(f"  📌 Homing pen to paper ({Z_UP:.1f}mm down @ F100)...")
-        g.send(f"G1 Z{-Z_UP:.2f} F100", wait_ok=True, timeout=30.0)
-        g.wait_motion()
+        total_y_moved = 0.0
 
-        pen = Pen(g, Z_UP, args.feed)
+        for i, line in enumerate(lines):
+            line_label = f"Line {i+1}/{len(lines)}" if len(lines) > 1 else "Centering"
 
-        print(f"\n  ✍ Writing: {args.text}")
-        render_text(pen, args.text, args.size, args.spacing)
+            if not line.strip():
+                # Empty line — just advance vertically
+                if i < len(lines) - 1:
+                    g.send(f"G1 Y{-line_height:.3f} F{TRAVEL_FEED}", wait_ok=True)
+                    g.wait_motion()
+                    total_y_moved += line_height
+                continue
 
-        # End with pen up (so paper can be removed)
-        pen.up()
+            total_width = calculate_text_width(line, args.size, args.spacing)
+            offset = total_width / 2.0
+            print(f"  ↔  {line_label}: width={total_width:.1f}mm, shifting left {offset:.1f}mm")
+
+            g.send(f"G1 X{-offset:.3f} F{TRAVEL_FEED}", wait_ok=True)
+            g.wait_motion()
+
+            pen = Pen(g, Z_UP, args.feed)
+            pen.is_up = True
+
+            print(f"  ✍ {line_label}: {line}")
+            render_text(pen, line, args.size, args.spacing)
+
+            pen.up()
+            g.send(f"G1 X{offset:.3f} F{TRAVEL_FEED}", wait_ok=True)
+            g.wait_motion()
+
+            if i < len(lines) - 1:
+                g.send(f"G1 Y{-line_height:.3f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+                total_y_moved += line_height
+
+        # Return to original Y position
+        if total_y_moved > 0:
+            g.send(f"G1 Y{total_y_moved:.3f} F{TRAVEL_FEED}", wait_ok=True)
+            g.wait_motion()
 
         print(f"\n  ✅ Done! (pen is up — safe to remove paper)")
 

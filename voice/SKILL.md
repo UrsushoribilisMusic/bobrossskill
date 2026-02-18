@@ -1,6 +1,7 @@
 ---
 name: voice
 description: Speak text aloud using macOS text-to-speech with the Evan voice.
+user-invocable: false
 metadata: {"openclaw": {"emoji": "🔊", "requires": {"os": ["darwin"]}}}
 ---
 

@@ -29,8 +29,16 @@ Z_UP = 5.0            # mm above paper (pen lifted)
 Z_DOWN = 0.0          # mm to lower from up position to touch paper
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
+READY_FLAG = "/tmp/huenit_ready.flag"
 
 OK_PAT = re.compile(rb"\bok\b", re.I)
+
+
+def check_ready():
+    if not os.path.exists(READY_FLAG):
+        print("  ❌ Robot not calibrated this session.")
+        print("     Run:  python3 huenit_draw.py calibrate")
+        sys.exit(1)
 
 
 # ── Serial / G-code ──────────────────────────────────────────────────────────
@@ -193,8 +201,9 @@ def calibrate(g):
             cal = {"z_up": round(z_up, 2), "note": "z_up = mm to lift pen above paper"}
             with open(CALIBRATION_FILE, "w") as f:
                 json.dump(cal, f, indent=2)
-            print(f"\n  ✅ Saved! Z_UP = {z_up:.1f}mm")
-            print(f"  Pen is parked at travel height. Ready to draw.")
+            with open(READY_FLAG, "w") as f:
+                f.write(f"calibrated z_up={z_up:.2f}\n")
+            print(f"\n  ✅ Saved! Z_UP = {z_up:.1f}mm — pen is UP and ready.")
             return
         elif ans == 'q':
             # Return pen to paper
@@ -249,42 +258,42 @@ def main():
             calibrate(g)
             return
 
+        check_ready()
         load_calibration()
 
-        # Home pen to paper level.
-        # Slowly moves down by Z_UP — safe whether pen starts at paper (gentle press)
-        # or at travel height (returns it to paper after a previous run).
-        print(f"  📌 Homing pen to paper ({Z_UP:.1f}mm down @ F100)...")
-        g.send(f"G1 Z{-Z_UP:.2f} F100", wait_ok=True, timeout=30.0)
-        g.wait_motion()
-
         if cmd == "square":
-            pen_up(g)
-            draw_square(g, size or 30.0)
+            s = size or 30.0
+            move_to(g, -s / 2, -s / 2)          # center: shift to bottom-left corner
+            draw_square(g, s)                     # ends back at bottom-left corner, pen up
+            move_to(g, s / 2, s / 2)             # return to original center
             print("\n  ✅ Done! (pen is up — safe to remove paper)")
 
         elif cmd == "triangle":
-            pen_up(g)
-            draw_triangle(g, size or 30.0)
+            s = size or 30.0
+            move_to(g, -s / 2, 0)               # center horizontally (base centered)
+            draw_triangle(g, s)                   # ends back at base-left, pen up
+            move_to(g, s / 2, 0)                # return to original center
             print("\n  ✅ Done! (pen is up — safe to remove paper)")
 
         elif cmd == "circle":
-            pen_up(g)
-            draw_circle(g, size or 15.0)
+            draw_circle(g, size or 15.0)          # already centered around start point, pen up
             print("\n  ✅ Done! (pen is up — safe to remove paper)")
 
         elif cmd == "demo":
-            pen_up(g)
-            # Square
-            draw_square(g, size or 25.0)
-            move_to(g, 35, 0)  # space between shapes
-            # Triangle
-            draw_triangle(g, size or 25.0)
-            move_to(g, 35, 0)
-            # Circle
-            draw_circle(g, size or 12.0)
-            # Return
-            move_to(g, -70 - (size or 12.0), 0)  # back roughly to start
+            s = size or 25.0
+            # Square (centered)
+            move_to(g, -s / 2, -s / 2)
+            draw_square(g, s)
+            move_to(g, s / 2 + 35, s / 2)       # back to center then right to next shape
+            # Triangle (centered)
+            move_to(g, -s / 2, 0)
+            draw_triangle(g, s)
+            move_to(g, s / 2 + 35, 0)           # back to center then right to next shape
+            # Circle (already centered)
+            r = size or 12.0
+            draw_circle(g, r)
+            # Return to original start
+            move_to(g, -(70 + r), 0)
             print("\n🎨 Demo complete! (pen is up — safe to remove paper)")
 
         else:

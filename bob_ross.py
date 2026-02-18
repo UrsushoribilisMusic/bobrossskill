@@ -105,10 +105,17 @@ def readiness_check():
     if not os.path.exists(PORT):
         issues.append(f"Robot arm port not found: {PORT}")
 
-    # Calibration
+    # Calibration file
     if not os.path.exists(CALIBRATION_FILE):
         issues.append(
             "No calibration file found. "
+            "Run: python3 ~/.openclaw/workspace/skills/huenit/huenit_draw.py calibrate"
+        )
+
+    # Session ready flag (set by calibrate, cleared on reboot)
+    if not os.path.exists("/tmp/huenit_ready.flag"):
+        issues.append(
+            "Robot not calibrated this session. "
             "Run: python3 ~/.openclaw/workspace/skills/huenit/huenit_draw.py calibrate"
         )
 
@@ -141,7 +148,15 @@ def readiness_check():
 # ── Ollama narration ──────────────────────────────────────────────────────────
 def generate_narration(action, content):
     """Ask Qwen to generate Bob Ross style narration. Returns dict or fallback."""
-    action_desc = f"write the text '{content}'" if action == "write" else f"draw a {content}"
+    if action == "write":
+        text_lines = content.replace('\\n', '\n').split('\n')
+        text_lines = [l for l in text_lines if l.strip()]
+        if len(text_lines) > 1:
+            action_desc = f"write {len(text_lines)} lines of text: {' / '.join(text_lines)}"
+        else:
+            action_desc = f"write the text '{content}'"
+    else:
+        action_desc = f"draw a {content}"
 
     prompt = (
         "You are Bob Ross, the gentle and poetic TV painter. "
