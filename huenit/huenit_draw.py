@@ -27,6 +27,7 @@ CIRCLE_SEGMENTS = 72  # line segments to approximate a circle
 # Z heights — override via calibration file
 Z_UP = 5.0            # mm above paper (pen lifted)
 Z_DOWN = 0.0          # mm to lower from up position to touch paper
+TILT_SLOPE = 0.0      # mm of Z correction per mm of Y travel (from tilt calibration)
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
 READY_FLAG = "/tmp/huenit_ready.flag"
@@ -102,15 +103,21 @@ def pen_down(g):
     g.wait_motion()
 
 
+def _z_comp(dy):
+    """Z compensation string for a Y move of dy mm."""
+    dz = TILT_SLOPE * dy
+    return f" Z{dz:.3f}" if abs(dz) > 0.001 else ""
+
+
 def move_to(g, x, y):
     """Relative travel move (pen should be up)."""
-    g.send(f"G1 X{x:.3f} Y{y:.3f} F{TRAVEL_FEED}", wait_ok=True)
+    g.send(f"G1 X{x:.3f} Y{y:.3f}{_z_comp(y)} F{TRAVEL_FEED}", wait_ok=True)
     g.wait_motion()
 
 
 def draw_to(g, x, y):
     """Relative draw move (pen should be down)."""
-    g.send(f"G1 X{x:.3f} Y{y:.3f} F{DRAW_FEED}", wait_ok=True)
+    g.send(f"G1 X{x:.3f} Y{y:.3f}{_z_comp(y)} F{DRAW_FEED}", wait_ok=True)
     g.wait_motion()
 
 
@@ -198,12 +205,62 @@ def calibrate(g):
 
         ans = input(f"  Pen is now {z_up:.1f}mm above paper. Does it clear the paper well? [y / enter new value / q=abort]: ").strip().lower()
         if ans in ('y', 'yes', ''):
-            cal = {"z_up": round(z_up, 2), "note": "z_up = mm to lift pen above paper"}
+            # ── Step 3: optional tilt calibration ─────────────────────────────
+            TILT_D = 40.0   # mm to travel in Y for tilt sample
+            tilt_slope = 0.0
+
+            print(f"\nStep 3 (optional): Y-tilt calibration.")
+            print(f"  This corrects for the paper not being perfectly level in the Y direction.")
+            tilt_ans = input("  Calibrate Y-tilt? [Enter=yes / n=skip]: ").strip().lower()
+
+            if tilt_ans != 'n':
+                print(f"\n  Moving {TILT_D:.0f}mm in Y...")
+                g.send(f"G1 Y{TILT_D:.1f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+
+                print(f"  Lowering pen to expected paper level...")
+                g.send(f"G1 Z{-z_up:.2f} F100", wait_ok=True)
+                g.wait_motion()
+
+                print(f"  Pen is now at Y+{TILT_D:.0f}mm at the height where paper was at Y=0.")
+                print(f"  Adjust until pen just touches paper here.")
+                print(f"  Enter +N to lower Nmm, -N to raise Nmm, or Enter when touching.")
+
+                z_adj = 0.0
+                while True:
+                    raw = input("  Touching? [Enter=yes / +N / -N]: ").strip()
+                    if raw in ('', 'y', 'yes'):
+                        break
+                    try:
+                        adj = float(raw)
+                        g.send(f"G1 Z{adj:.2f} F100", wait_ok=True)
+                        g.wait_motion()
+                        z_adj += adj
+                    except ValueError:
+                        print("  ⚠  Enter a number like +2 or -1.5, or Enter to confirm.")
+
+                tilt_slope = z_adj / TILT_D
+                print(f"  Tilt slope: {tilt_slope:.5f} mm/mm "
+                      f"({tilt_slope * 10:.2f}mm per 10cm of Y travel)")
+
+                # Lift pen back to travel height and return to Y=0
+                g.send(f"G1 Z{z_up - z_adj:.2f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+                g.send(f"G1 Y{-TILT_D:.1f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+                print(f"  Returned to start.")
+
+            # ── Save all calibration ───────────────────────────────────────────
+            cal = {
+                "z_up":       round(z_up, 2),
+                "tilt_slope": round(tilt_slope, 5),
+                "note":       "z_up = pen travel height mm; tilt_slope = Z mm per Y mm"
+            }
             with open(CALIBRATION_FILE, "w") as f:
                 json.dump(cal, f, indent=2)
             with open(READY_FLAG, "w") as f:
-                f.write(f"calibrated z_up={z_up:.2f}\n")
-            print(f"\n  ✅ Saved! Z_UP = {z_up:.1f}mm — pen is UP and ready.")
+                f.write(f"calibrated z_up={z_up:.2f} tilt={tilt_slope:.5f}\n")
+            print(f"\n  ✅ Saved! Z_UP={z_up:.1f}mm  tilt={tilt_slope:.5f} mm/mm — pen is UP and ready.")
             return
         elif ans == 'q':
             # Return pen to paper
@@ -222,12 +279,14 @@ def calibrate(g):
 
 
 def load_calibration():
-    global Z_UP
+    global Z_UP, TILT_SLOPE
     if os.path.exists(CALIBRATION_FILE):
         with open(CALIBRATION_FILE) as f:
             cal = json.load(f)
-        Z_UP = cal.get("z_up", Z_UP)
-        print(f"  📐 Loaded calibration: Z_UP = {Z_UP:.1f}mm")
+        Z_UP        = cal.get("z_up", Z_UP)
+        TILT_SLOPE  = cal.get("tilt_slope", 0.0)
+        tilt_info   = f", tilt={TILT_SLOPE:.4f} mm/mm" if TILT_SLOPE != 0 else ", no tilt"
+        print(f"  📐 Loaded calibration: Z_UP = {Z_UP:.1f}mm{tilt_info}")
     else:
         print(f"  📐 No calibration file — using default Z_UP = {Z_UP:.1f}mm")
         print(f"     Run 'python3 huenit_draw.py calibrate' to calibrate.")

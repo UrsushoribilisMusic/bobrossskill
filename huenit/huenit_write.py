@@ -28,6 +28,7 @@ Z_UP = 3.0  # default, overridden by calibration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "calibration.json")
 READY_FLAG = "/tmp/huenit_ready.flag"
+TILT_SLOPE = 0.0      # mm of Z correction per mm of Y travel (loaded from calibration)
 
 OK_PAT = re.compile(rb"\bok\b", re.I)
 
@@ -262,7 +263,9 @@ class Pen:
         dx = x - self.cursor_x
         dy = y - self.cursor_y
         if abs(dx) > 0.01 or abs(dy) > 0.01:
-            self.g.send(f"G1 X{dx:.3f} Y{dy:.3f} F{TRAVEL_FEED}", wait_ok=True)
+            dz = TILT_SLOPE * dy
+            z_comp = f" Z{dz:.3f}" if abs(dz) > 0.001 else ""
+            self.g.send(f"G1 X{dx:.3f} Y{dy:.3f}{z_comp} F{TRAVEL_FEED}", wait_ok=True)
             self.g.wait_motion()
         self.cursor_x = x
         self.cursor_y = y
@@ -272,7 +275,9 @@ class Pen:
         dx = x - self.cursor_x
         dy = y - self.cursor_y
         if abs(dx) > 0.01 or abs(dy) > 0.01:
-            self.g.send(f"G1 X{dx:.3f} Y{dy:.3f} F{self.draw_feed}", wait_ok=True)
+            dz = TILT_SLOPE * dy
+            z_comp = f" Z{dz:.3f}" if abs(dz) > 0.001 else ""
+            self.g.send(f"G1 X{dx:.3f} Y{dy:.3f}{z_comp} F{self.draw_feed}", wait_ok=True)
             self.g.wait_motion()
         self.cursor_x = x
         self.cursor_y = y
@@ -359,12 +364,14 @@ def main():
     check_ready()
 
     # Load calibration
-    global Z_UP
+    global Z_UP, TILT_SLOPE
     if os.path.exists(CALIBRATION_FILE):
         with open(CALIBRATION_FILE) as f:
             cal = json.load(f)
-        Z_UP = cal.get("z_up", Z_UP)
-        print(f"  📐 Calibration: Z_UP = {Z_UP:.1f}mm")
+        Z_UP       = cal.get("z_up", Z_UP)
+        TILT_SLOPE = cal.get("tilt_slope", 0.0)
+        tilt_info  = f", tilt={TILT_SLOPE:.4f} mm/mm" if TILT_SLOPE != 0 else ""
+        print(f"  📐 Calibration: Z_UP = {Z_UP:.1f}mm{tilt_info}")
     else:
         print(f"  📐 No calibration — using Z_UP = {Z_UP:.1f}mm")
 
@@ -414,13 +421,19 @@ def main():
             g.wait_motion()
 
             if i < len(lines) - 1:
-                g.send(f"G1 Y{-line_height:.3f} F{TRAVEL_FEED}", wait_ok=True)
+                dy = -line_height
+                dz = TILT_SLOPE * dy
+                z_comp = f" Z{dz:.3f}" if abs(dz) > 0.001 else ""
+                g.send(f"G1 Y{dy:.3f}{z_comp} F{TRAVEL_FEED}", wait_ok=True)
                 g.wait_motion()
                 total_y_moved += line_height
 
         # Return to original Y position
         if total_y_moved > 0:
-            g.send(f"G1 Y{total_y_moved:.3f} F{TRAVEL_FEED}", wait_ok=True)
+            dy = total_y_moved
+            dz = TILT_SLOPE * dy
+            z_comp = f" Z{dz:.3f}" if abs(dz) > 0.001 else ""
+            g.send(f"G1 Y{dy:.3f}{z_comp} F{TRAVEL_FEED}", wait_ok=True)
             g.wait_motion()
 
         print(f"\n  ✅ Done! (pen is up — safe to remove paper)")

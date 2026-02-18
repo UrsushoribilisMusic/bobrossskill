@@ -155,6 +155,8 @@ def generate_narration(action, content):
             action_desc = f"write {len(text_lines)} lines of text: {' / '.join(text_lines)}"
         else:
             action_desc = f"write the text '{content}'"
+    elif action == "svg":
+        action_desc = f"draw a vector illustration from the file '{os.path.basename(content)}'"
     else:
         action_desc = f"draw a {content}"
 
@@ -244,6 +246,10 @@ def run_draw(action, content, size=None):
         cmd = ["python3", os.path.join(HUENIT_DIR, "huenit_draw.py"), content]
         if size:
             cmd.append(str(size))
+    elif action == "svg":
+        cmd = ["python3", os.path.join(HUENIT_DIR, "huenit_svg.py"), content]
+        if size:
+            cmd += ["--size", str(size)]
     else:
         print(f"  ⚠  Unknown action: {action}")
         return False
@@ -296,16 +302,16 @@ def handle_stop(signum, frame):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Bob Ross mode for the Huenit robot arm")
+    parser = argparse.ArgumentParser(description="Robot Ross mode for the Huenit robot arm")
     parser.add_argument(
         "action",
-        choices=["write", "draw", "check", "calibrate"],
-        help="write TEXT | draw SHAPE | check (readiness only) | calibrate (set Z travel height)",
+        choices=["write", "draw", "svg", "check", "calibrate"],
+        help="write TEXT | draw SHAPE | svg FILE | check (readiness only) | calibrate",
     )
     parser.add_argument(
         "content",
         nargs="?",
-        help="Text to write, or shape: square / triangle / circle / demo",
+        help="Text to write, shape name, or path to SVG file",
     )
     parser.add_argument("--size", type=float, help="Size in mm (letter height or shape size)")
     parser.add_argument("--no-voice", action="store_true", help="Skip all voice narration")
@@ -315,7 +321,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_stop)
 
     # ── READINESS CHECK ───────────────────────────────────────────────────────
-    print("[bob-ross] Checking system readiness...")
+    print("[robot-ross] Checking system readiness...")
     issues = readiness_check()
 
     if args.action == "calibrate":
