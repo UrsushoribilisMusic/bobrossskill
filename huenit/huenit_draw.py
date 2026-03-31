@@ -14,8 +14,26 @@ The drawing plane is X/Y. Z controls pen up/down.
 Calibrate first to find your Z_DOWN (pen touches paper) and Z_UP (pen lifted).
 """
 
-import sys, os, time, re, math, threading, json
+import sys, os, time, re, math, threading, json, tempfile
+from datetime import datetime
 import serial
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+_LOG_FILE = os.path.join(os.path.dirname(__file__), "huenit_draw.log")
+
+def _log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PORT = os.environ.get("HUENIT_PORT", "/dev/cu.usbserial-310")
@@ -27,10 +45,11 @@ CIRCLE_SEGMENTS = 72  # line segments to approximate a circle
 # Z heights — override via calibration file
 Z_UP = 5.0            # mm above paper (pen lifted)
 Z_DOWN = 0.0          # mm to lower from up position to touch paper
-TILT_SLOPE = 0.0      # mm of Z correction per mm of Y travel (from tilt calibration)
+TILT_SLOPE   = 0.0    # mm of Z correction per mm of Y travel (from tilt calibration)
+TILT_SLOPE_X = 0.0    # mm of Z correction per mm of X travel (from tilt calibration)
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
-READY_FLAG = "/tmp/huenit_ready.flag"
+READY_FLAG = os.path.join(tempfile.gettempdir(), "huenit_ready.flag")
 
 OK_PAT = re.compile(rb"\bok\b", re.I)
 
@@ -46,6 +65,11 @@ def check_ready():
 class GCodeIO:
     def __init__(self, port, baud):
         self.ser = serial.Serial(port, baud, timeout=0.05)
+        # Wait for firmware to finish any reset/boot sequence, then discard
+        # startup messages so they don't pollute the ok-response detection.
+        time.sleep(2.0)
+        self.ser.reset_input_buffer()
+        _log(f"PORT opened {port} (boot wait done)")
         self.buf = bytearray()
         self.lock = threading.Lock()
         self._rx = threading.Thread(target=self._rx_loop, daemon=True)
@@ -77,7 +101,10 @@ class GCodeIO:
                 if OK_PAT.search(self.buf):
                     self.buf.clear()
                     return
-        print(f"  ⚠ timeout waiting for ok on: {line}")
+        # Clear stale buffer so next command doesn't get a false ok
+        with self.lock:
+            self.buf.clear()
+        _log(f"TIMEOUT waiting for ok on: {line}")
 
     def wait_motion(self):
         """Wait for all queued motion to complete."""
@@ -172,21 +199,36 @@ def draw_circle(g, radius=15.0):
 
 
 # ── Calibration ───────────────────────────────────────────────────────────────
-def calibrate(g):
+def calibrate(g, size=None):
     """
     Calibration — new flow:
       1. User manually positions pen TOUCHING the paper (pen is DOWN).
       2. Press ENTER to confirm.
       3. Enter desired travel height in mm (recommended 5-8mm).
       4. Arm lifts pen to that height. Confirm or retry.
+
+    size: requested drawing size in mm. If > 80, tilt calibration extends to cover it.
     """
-    print("\n🔧 Calibration Mode")
-    print("Step 1: Position the pen so it TOUCHES the paper.")
-    print("        (Use huenit_jog_control.py if you need to jog the arm first.)")
-    ans = input("        Pen touching paper? Press ENTER to continue, or type 'q' to abort: ").strip().lower()
-    if ans == 'q':
-        print("  ❌ Calibration aborted.")
-        return
+    _log("CALIBRATION START")
+    print("\n Calibration Mode")
+    print("Step 1: Jog the tip until it TOUCHES the surface.")
+    print("  W = up 0.5mm  |  S = down 0.5mm  |  Enter = confirm touching  |  Q = abort")
+    import msvcrt
+    while True:
+        ch = msvcrt.getch()
+        if ch in (b'\r', b'\n'):
+            break
+        if ch.lower() == b'q':
+            print("\n  ❌ Calibration aborted.")
+            return
+        if ch.lower() == b'w':
+            g.send("G1 Z0.5 F100", wait_ok=True)
+            g.wait_motion()
+            print("  > Z +0.5mm")
+        elif ch.lower() == b's':
+            g.send("G1 Z-0.5 F100", wait_ok=True)
+            g.wait_motion()
+            print("  > Z -0.5mm")
 
     while True:
         try:
@@ -200,67 +242,150 @@ def calibrate(g):
             continue
 
         print(f"  ↑ Lifting pen {z_up:.1f}mm...")
+        _log(f"CALIBRATION LIFT z_up={z_up:.2f}mm")
         g.send(f"G1 Z{z_up:.2f} F{TRAVEL_FEED}", wait_ok=True)
         g.wait_motion()
+        _log(f"CALIBRATION LIFT done — tip should be {z_up:.2f}mm above surface")
 
         ans = input(f"  Pen is now {z_up:.1f}mm above paper. Does it clear the paper well? [y / enter new value / q=abort]: ").strip().lower()
         if ans in ('y', 'yes', ''):
-            # ── Step 3: optional tilt calibration ─────────────────────────────
-            TILT_D = 40.0   # mm to travel in Y for tilt sample
-            tilt_slope = 0.0
+            # ── Step 3: 5-point cross tilt calibration ────────────────────────
+            TILT_D = max(40.0, size / 2) if size and size > 80 else 40.0
+            tilt_slope   = 0.0
+            tilt_slope_x = 0.0
 
-            print(f"\nStep 3 (optional): Y-tilt calibration.")
-            print(f"  This corrects for the paper not being perfectly level in the Y direction.")
-            tilt_ans = input("  Calibrate Y-tilt? [Enter=yes / n=skip]: ").strip().lower()
+            print(f"\nStep 3 (optional): 5-point cross tilt calibration.")
+            if size and size > 80:
+                print(f"  Drawing size {size:.0f}mm > 80mm — extending tilt range to ±{TILT_D:.0f}mm.")
+            print(f"  Samples center + Y±{TILT_D:.0f}mm + X±{TILT_D:.0f}mm.")
+            tilt_ans = input("  Calibrate tilt? [Enter=yes / n=skip / q=quit]: ").strip().lower()
+            if tilt_ans == 'q':
+                print("  ❌ Calibration aborted.")
+                return
+
+            def _save_and_exit(z_up, tilt_y=0.0, tilt_x=0.0, note=""):
+                """Save calibration (z_up only or full) and write READY_FLAG."""
+                cal = {"z_up": round(z_up, 2), "tilt_slope": round(tilt_y, 5),
+                       "tilt_slope_x": round(tilt_x, 5),
+                       "note": "z_up = pen travel height mm; tilt_slope = Z mm per Y mm; tilt_slope_x = Z mm per X mm"}
+                with open(CALIBRATION_FILE, "w") as f:
+                    json.dump(cal, f, indent=2)
+                with open(READY_FLAG, "w") as f:
+                    f.write(f"calibrated z_up={z_up:.2f} tilt_y={tilt_y:.5f} tilt_x={tilt_x:.5f}\n")
+                _log(f"CALIBRATION SAVED z_up={z_up:.2f} tilt_y={tilt_y:.5f} tilt_x={tilt_x:.5f} {note}")
+                print(f"\n  Saved! Z_UP={z_up:.1f}mm  tilt_y={tilt_y:.5f}  tilt_x={tilt_x:.5f}"
+                      + (f"  ({note})" if note else "") + " — pen is UP and ready.")
+
+            def fine_touch(label):
+                """W/S fine jog (0.1mm) until touching. Returns Z adjustment or None if aborted."""
+                print(f"\n  [{label}]  W=up 0.1mm | S=down 0.1mm | Enter=touching | Q=abort")
+                z_adj = 0.0
+                while True:
+                    ch = msvcrt.getch()
+                    if ch in (b'\r', b'\n'):
+                        return z_adj
+                    if ch.lower() == b'q':
+                        return None
+                    if ch.lower() == b'w':
+                        g.send("G1 Z0.1 F50", wait_ok=True)
+                        g.wait_motion()
+                        z_adj += 0.1
+                        print(f"    Z +0.1mm  (total: {z_adj:+.2f}mm)")
+                    elif ch.lower() == b's':
+                        g.send("G1 Z-0.1 F50", wait_ok=True)
+                        g.wait_motion()
+                        z_adj -= 0.1
+                        print(f"    Z -0.1mm  (total: {z_adj:+.2f}mm)")
+
+            def _abort_tilt(cur_z_adj, cur_x=0.0, cur_y=0.0):
+                """Lift pen, return to origin, save z_up-only calibration."""
+                print("\n  Q pressed — aborting tilt calibration...")
+                g.send(f"G1 Z{-cur_z_adj:.2f} F{TRAVEL_FEED}", wait_ok=True)   # lift back
+                g.wait_motion()
+                if cur_y != 0.0:
+                    g.send(f"G1 Y{-cur_y:.2f} F{TRAVEL_FEED}", wait_ok=True)
+                    g.wait_motion()
+                if cur_x != 0.0:
+                    g.send(f"G1 X{-cur_x:.2f} F{TRAVEL_FEED}", wait_ok=True)
+                    g.wait_motion()
+                _save_and_exit(z_up, note="tilt skipped — aborted")
+                return
 
             if tilt_ans != 'n':
-                print(f"\n  Moving {TILT_D:.0f}mm in Y...")
+                # ── Point B: Y+40 ──────────────────────────────────────────────
+                print(f"\n  Moving to Y+{TILT_D:.0f}mm...")
+                g.send(f"G1 Y{TILT_D:.1f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+                print(f"  Tip is at travel height. Jog down slowly until touching.")
+                z_adj_ypos = fine_touch(f"Y+{TILT_D:.0f}mm")
+                if z_adj_ypos is None:
+                    _abort_tilt(0.0, cur_y=TILT_D)
+                    return
+
+                _log(f"TILT Y+{TILT_D:.0f} touch done z_adj={z_adj_ypos:+.2f}mm, lifting Z{-z_adj_ypos:+.2f}")
+                g.send(f"G1 Z{-z_adj_ypos:.2f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+                print(f"\n  Moving to Y-{TILT_D:.0f}mm...")
+                g.send(f"G1 Y{-TILT_D * 2:.1f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+
+                # ── Point C: Y-40 ──────────────────────────────────────────────
+                print(f"  Tip is at travel height. Jog down slowly until touching.")
+                z_adj_yneg = fine_touch(f"Y-{TILT_D:.0f}mm")
+                if z_adj_yneg is None:
+                    _abort_tilt(0.0, cur_y=-TILT_D)
+                    return
+
+                _log(f"TILT Y-{TILT_D:.0f} touch done z_adj={z_adj_yneg:+.2f}mm, lifting Z{-z_adj_yneg:+.2f}")
+                g.send(f"G1 Z{-z_adj_yneg:.2f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+                print(f"\n  Returning to Y=0...")
                 g.send(f"G1 Y{TILT_D:.1f} F{TRAVEL_FEED}", wait_ok=True)
                 g.wait_motion()
 
-                print(f"  Lowering pen to expected paper level...")
-                g.send(f"G1 Z{-z_up:.2f} F100", wait_ok=True)
+                # ── Point D: X+40 ──────────────────────────────────────────────
+                print(f"\n  Moving to X+{TILT_D:.0f}mm...")
+                g.send(f"G1 X{TILT_D:.1f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+                print(f"  Tip is at travel height. Jog down slowly until touching.")
+                z_adj_xpos = fine_touch(f"X+{TILT_D:.0f}mm")
+                if z_adj_xpos is None:
+                    _abort_tilt(0.0, cur_x=TILT_D)
+                    return
+
+                _log(f"TILT X+{TILT_D:.0f} touch done z_adj={z_adj_xpos:+.2f}mm, lifting Z{-z_adj_xpos:+.2f}")
+                g.send(f"G1 Z{-z_adj_xpos:.2f} F{TRAVEL_FEED}", wait_ok=True)
+                g.wait_motion()
+                print(f"\n  Moving to X-{TILT_D:.0f}mm...")
+                g.send(f"G1 X{-TILT_D * 2:.1f} F{TRAVEL_FEED}", wait_ok=True)
                 g.wait_motion()
 
-                print(f"  Pen is now at Y+{TILT_D:.0f}mm at the height where paper was at Y=0.")
-                print(f"  Adjust until pen just touches paper here.")
-                print(f"  Enter +N to lower Nmm, -N to raise Nmm, or Enter when touching.")
+                # ── Point E: X-40 ──────────────────────────────────────────────
+                print(f"  Tip is at travel height. Jog down slowly until touching.")
+                z_adj_xneg = fine_touch(f"X-{TILT_D:.0f}mm")
+                if z_adj_xneg is None:
+                    _abort_tilt(0.0, cur_x=-TILT_D)
+                    return
 
-                z_adj = 0.0
-                while True:
-                    raw = input("  Touching? [Enter=yes / +N / -N]: ").strip()
-                    if raw in ('', 'y', 'yes'):
-                        break
-                    try:
-                        adj = float(raw)
-                        g.send(f"G1 Z{adj:.2f} F100", wait_ok=True)
-                        g.wait_motion()
-                        z_adj += adj
-                    except ValueError:
-                        print("  ⚠  Enter a number like +2 or -1.5, or Enter to confirm.")
-
-                tilt_slope = z_adj / TILT_D
-                print(f"  Tilt slope: {tilt_slope:.5f} mm/mm "
-                      f"({tilt_slope * 10:.2f}mm per 10cm of Y travel)")
-
-                # Lift pen back to travel height and return to Y=0
-                g.send(f"G1 Z{z_up - z_adj:.2f} F{TRAVEL_FEED}", wait_ok=True)
+                _log(f"TILT X-{TILT_D:.0f} touch done z_adj={z_adj_xneg:+.2f}mm, lifting Z{-z_adj_xneg:+.2f}")
+                g.send(f"G1 Z{-z_adj_xneg:.2f} F{TRAVEL_FEED}", wait_ok=True)
                 g.wait_motion()
-                g.send(f"G1 Y{-TILT_D:.1f} F{TRAVEL_FEED}", wait_ok=True)
+                print(f"\n  Returning to X=0, Y=0...")
+                g.send(f"G1 X{TILT_D:.1f} F{TRAVEL_FEED}", wait_ok=True)
                 g.wait_motion()
-                print(f"  Returned to start.")
+
+                # ── Compute slopes (least squares through origin) ──────────────
+                tilt_slope   = (TILT_D * z_adj_ypos + (-TILT_D) * z_adj_yneg) / (2 * TILT_D ** 2)
+                tilt_slope_x = (TILT_D * z_adj_xpos + (-TILT_D) * z_adj_xneg) / (2 * TILT_D ** 2)
+                print(f"\n  Y+{TILT_D:.0f}mm: {z_adj_ypos:+.2f}mm  |  Y-{TILT_D:.0f}mm: {z_adj_yneg:+.2f}mm")
+                print(f"  X+{TILT_D:.0f}mm: {z_adj_xpos:+.2f}mm  |  X-{TILT_D:.0f}mm: {z_adj_xneg:+.2f}mm")
+                print(f"  Y tilt: {tilt_slope:.5f} mm/mm  ({tilt_slope*10:.3f}mm per 10cm Y)")
+                print(f"  X tilt: {tilt_slope_x:.5f} mm/mm  ({tilt_slope_x*10:.3f}mm per 10cm X)")
+                print(f"  Returned to origin.")
 
             # ── Save all calibration ───────────────────────────────────────────
-            cal = {
-                "z_up":       round(z_up, 2),
-                "tilt_slope": round(tilt_slope, 5),
-                "note":       "z_up = pen travel height mm; tilt_slope = Z mm per Y mm"
-            }
-            with open(CALIBRATION_FILE, "w") as f:
-                json.dump(cal, f, indent=2)
-            with open(READY_FLAG, "w") as f:
-                f.write(f"calibrated z_up={z_up:.2f} tilt={tilt_slope:.5f}\n")
-            print(f"\n  ✅ Saved! Z_UP={z_up:.1f}mm  tilt={tilt_slope:.5f} mm/mm — pen is UP and ready.")
+            _log(f"CALIBRATION END — tip is at z_up={z_up:.2f}mm above surface, safe to proceed")
+            _save_and_exit(z_up, tilt_slope, tilt_slope_x)
             return
         elif ans == 'q':
             # Return pen to paper
@@ -279,13 +404,14 @@ def calibrate(g):
 
 
 def load_calibration():
-    global Z_UP, TILT_SLOPE
+    global Z_UP, TILT_SLOPE, TILT_SLOPE_X
     if os.path.exists(CALIBRATION_FILE):
         with open(CALIBRATION_FILE) as f:
             cal = json.load(f)
-        Z_UP        = cal.get("z_up", Z_UP)
-        TILT_SLOPE  = cal.get("tilt_slope", 0.0)
-        tilt_info   = f", tilt={TILT_SLOPE:.4f} mm/mm" if TILT_SLOPE != 0 else ", no tilt"
+        Z_UP         = cal.get("z_up", Z_UP)
+        TILT_SLOPE   = cal.get("tilt_slope", 0.0)
+        TILT_SLOPE_X = cal.get("tilt_slope_x", 0.0)
+        tilt_info    = f", tilt_y={TILT_SLOPE:.4f} tilt_x={TILT_SLOPE_X:.4f}" if TILT_SLOPE != 0 or TILT_SLOPE_X != 0 else ", no tilt"
         print(f"  📐 Loaded calibration: Z_UP = {Z_UP:.1f}mm{tilt_info}")
     else:
         print(f"  📐 No calibration file — using default Z_UP = {Z_UP:.1f}mm")
@@ -360,7 +486,8 @@ def main():
             sys.exit(1)
 
     finally:
-        g.send("G90", wait_ok=True)
+        # Do NOT send G90 — on Huenit firmware, switching from G91 to G90
+        # drops the tip to absolute Z=0 (surface), causing burns.
         g.close()
 
 

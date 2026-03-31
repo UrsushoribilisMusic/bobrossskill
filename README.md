@@ -1,62 +1,199 @@
-# Bob Ross Skill — OpenClaw
+# Robot Ross Skill
 
-An OpenClaw skill that controls a Huenit robot arm to draw and write on paper, while narrating poetically in the style of Bob Ross.
+> A Huenit robot arm that draws on paper while narrating in the warm, peaceful style of Bob Ross.
 
-## How it works
+---
 
-1. **Safety warning** — 3 beeps so humans step clear
-2. **Intro** — Qwen (local LLM via Ollama) generates a Bob Ross-style intro: *"We got a lovely request for..."*
-3. **Draw + live commentary** — the arm draws while the Evan voice narrates in the background
-4. **Outro** — *"Finished, you can remove your piece now"*
+## What Is This?
 
-## Skills
+**Robot Ross** is an OpenClaw skill that controls a Huenit robot arm to draw/write on paper, narrate the process in Bob Ross style via a local AI model (Apertus 8B), and optionally engage visitors in live voice conversation.
 
-| Skill | Description |
-|-------|-------------|
-| `bob-ross` | Main orchestrator — handles narration, safety, and coordinates the arm |
-| `huenit` | Low-level robot arm control (calibration, jogging) |
-| `voice` | macOS TTS via the Evan voice (`say` command) |
+Three modes:
+- **Headless** — `bob_ross.py` is called directly (Telegram, scripts, order automation)
+- **Voice showcase** — `chat_ross.py` listens via microphone, chats, and draws on request
+- **Pyrography** — `--pyro` flag slows the feed rate for wood burning
 
-## Requirements
+---
 
-- macOS (uses `say` for TTS and `afplay` for warning beeps)
-- [Huenit robot arm](https://huenit.com) connected via USB serial
-- [Ollama](https://ollama.ai) running locally with `qwen2.5:7b`
-- [OpenClaw](https://openclaw.ai) installed
+## Quick Start
 
-## Usage
+### Prerequisites
 
 ```bash
-# Full Bob Ross experience
-python3 bob-ross/bob_ross.py write "OpenClaw"
-python3 bob-ross/bob_ross.py draw square
+# Core (all platforms)
+pip install pyserial anthropic
 
-# Silent test (no voice)
-python3 bob-ross/bob_ross.py write "Hi" --no-voice
+# Voice showcase
+pip install openai-whisper sounddevice kokoro soundfile "numpy<2.0" espeakng-loader mistralai
 
-# Readiness check
-python3 bob-ross/bob_ross.py check
-
-# Calibrate pen height
-python3 bob-ross/bob_ross.py calibrate
+# Image tracing (optional)
+pip install vtracer pillow pillow-heif
 ```
 
-## Via Telegram (OpenClaw)
+Ollama must be running with Apertus loaded:
+```bash
+ollama pull MichelRosselli/apertus:8b-instruct-2509-q4_k_m
+```
 
-Once installed in your OpenClaw workspace, just message your bot:
+### API keys
 
-> *"Bob Ross write OpenClaw"*
-> *"Draw a circle Bob Ross style"*
-> *"Stop the arm"*
+Keys are loaded from [Infisical](https://infisical.com/) vault if available, otherwise from environment variables:
 
-## Logs
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # for AI sketch generation + Haiku conversation
+export MISTRAL_API_KEY=...            # for Voxtral TTS (optional)
+```
 
-Events are logged with timestamps to `bob-ross/bob_ross.log`.
+### Serial port
 
-## Setup
+```bash
+# Mac (default)
+export HUENIT_PORT=/dev/cu.usbserial-310
 
-1. Copy the three skill folders into `~/.openclaw/workspace/skills/`
-2. Start Ollama: `ollama serve` (or set up as a launchd service)
-3. Pull the model: `ollama pull qwen2.5:7b`
-4. Calibrate: `python3 bob-ross/bob_ross.py calibrate`
-5. Restart OpenClaw to pick up the new skills
+# Windows
+set HUENIT_PORT=COM3
+```
+
+---
+
+## Calibrate
+
+```bash
+python bob_ross.py calibrate
+```
+
+Press **Q** at any calibration step to abort and save Z height only.
+
+---
+
+## Headless drawing (`bob_ross.py`)
+
+```bash
+# Write text
+python bob_ross.py write "Hello World"
+
+# Draw a shape
+python bob_ross.py draw circle 40
+
+# Draw an SVG file
+python bob_ross.py svg path/to/file.svg --size 80
+
+# AI-generated sketch
+python bob_ross.py sketch "a lighthouse on a rocky coast" --size 80
+
+# Pyrography (wood burning)
+python bob_ross.py svg logo.svg --pyro --size 60
+
+# Test narration without moving the arm
+python bob_ross.py sketch "a happy little tree" --dry-run
+
+# System check
+python bob_ross.py check
+```
+
+Key flags:
+
+| Flag | Description |
+|---|---|
+| `--size 80` | Drawing size in mm (default 80) |
+| `--feed 400` | Feed rate mm/min |
+| `--buyer "Alice"` | Personalise narration with visitor name |
+| `--pyro` | Pyrography mode — slow feed for wood burning |
+| `--engine kokoro\|voxtral\|system` | TTS engine (default: kokoro) |
+| `--no-voice` | Skip all narration |
+| `--dry-run` | Narrate without moving the arm |
+| `--direct` | Skip preview, draw immediately |
+
+---
+
+## Voice showcase (`chat_ross.py`)
+
+A full voice conversation loop: visitor speaks → Whisper transcribes → brain (Haiku or Apertus) decides → Voxtral/Kokoro speaks → arm draws.
+
+```bash
+# Mac
+python chat_ross.py --brain apertus --engine voxtral --lang en
+
+# Windows
+set HUENIT_PORT=COM3 && python chat_ross.py --brain apertus --engine voxtral --no-obs --lang en
+
+# Test without arm movement
+python chat_ross.py --no-arm --brain apertus --engine voxtral
+```
+
+Key flags:
+
+| Flag | Description |
+|---|---|
+| `--brain haiku\|apertus\|mistral` | Conversation LLM (default: haiku) |
+| `--engine kokoro\|voxtral\|system` | TTS engine (default: voxtral) |
+| `--lang en` | Force STT language |
+| `--whisper base` | Whisper model size (tiny/base/small/medium) |
+| `--threshold 0.03` | Mic RMS threshold (raise in noisy rooms) |
+| `--size 80` | Drawing size mm |
+| `--no-arm` | Conversation + narration only, no arm movement |
+| `--no-obs` | Skip OBS recording |
+
+Press **Q** to quit gracefully, or say "goodbye" / "bye".
+
+**Conversation flow:**
+1. Robot Ross greets the visitor
+2. Visitor describes what to draw
+3. Robot Ross repeats the request and asks for confirmation ("Shall I go ahead?")
+4. On "yes" → calibrates (first draw only) → draws while narrating
+5. Conversation TTS mutes while arm is narrating — no audio overlap
+
+---
+
+## Pre-made SVGs
+
+Drop any `.svg` file in the repo root. `chat_ross.py` discovers them automatically and tells the brain about them so it can recommend them for instant draws (no AI generation wait).
+
+---
+
+## Pyrography mode
+
+`--pyro` reduces the feed rate to ~45 mm/min for slow, controlled burns on wood. Works with any drawing command:
+
+```bash
+python bob_ross.py svg design.svg --pyro --size 60
+python chat_ross.py --pyro --engine voxtral
+```
+
+---
+
+## AI stack
+
+| Role | Model | Runtime |
+|---|---|---|
+| Showcase conversation | Claude Haiku 4.5 | Anthropic API |
+| Showcase conversation (local) | Apertus 8B | Ollama local |
+| Bob Ross narration | Apertus 8B | Ollama local |
+| AI sketch / SVG generation | Claude Haiku 4.5 | Anthropic API |
+| Speech-to-text | Whisper base | Local |
+| TTS (showcase) | Voxtral mini | Mistral API |
+| TTS (narration) | Kokoro 82M | Local |
+| TTS (fallback) | System (PowerShell/say/espeak) | Built-in |
+
+*[Apertus](https://huggingface.co/MichelRosselli/apertus) is developed by MichelRosselli as part of an Innosuisse-funded Swiss AI project.*
+
+---
+
+## File structure
+
+```
+bobrossskill/
+├── bob_ross.py             # Headless orchestrator (write/draw/svg/sketch/pyro)
+├── chat_ross.py            # Voice showcase loop (STT → brain → TTS → draw)
+├── ARCHITECTURE.md         # Full architecture diagram
+├── huenit/
+│   ├── huenit_svg.py       # SVG → G-code (Bezier-aware, path sort)
+│   ├── huenit_write.py     # Text calligraphy (auto-scale, multi-line)
+│   ├── huenit_draw.py      # Shapes + interactive calibration
+│   ├── huenit_jog_control.py  # Manual jog utility
+│   ├── huenit_wave.py      # Greeting gesture
+│   └── calibration.json    # Saved Z/tilt calibration (auto-generated)
+└── voice/
+    ├── speak.py            # TTS: Kokoro / Voxtral / system fallback
+    └── listen.py           # STT: Whisper with VAD silence detection
+```

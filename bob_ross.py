@@ -5,36 +5,48 @@ bob_ross.py
 Bob Ross mode: the Huenit robot arm draws/writes while narrating poetically.
 
 Usage:
-    python3 bob_ross.py write "OpenClaw"
-    python3 bob_ross.py write "Hello" --size 15
-    python3 bob_ross.py draw square
-    python3 bob_ross.py draw circle 20
-    python3 bob_ross.py check          # readiness check only
+    python bob_ross.py write "OpenClaw"
+    python bob_ross.py sketch "a happy little bear"    # AI-generated SVG
+    python bob_ross.py svg path/to/file.svg
+    python bob_ross.py draw square
+    python bob_ross.py check          # readiness check only
+    python bob_ross.py calibrate      # interactive calibration
+
+Options:
+    --size 80          drawing size mm (default: 80)
+    --feed 400         feed rate mm/min
+    --buyer "Alice"    personalise narration with visitor name
+    --pyro             pyrography (wood burning) mode — slow feed
+    --engine kokoro    TTS engine: kokoro (local) | voxtral (Mistral API) | system
+    --no-voice         skip all narration
+    --dry-run          narrate without moving the arm (test/demo mode)
+    --direct           skip preview, draw immediately
+    --calibrate        run calibration before drawing
 
 Stop at any time with Ctrl+C or SIGTERM.
 """
 
-import sys
-import os
-import json
-import subprocess
-import threading
-import time
-import signal
-import argparse
-import urllib.request
-import urllib.error
+import sys, os, json, subprocess, threading, time, signal, argparse, re
+import urllib.request, urllib.error
 from datetime import datetime
+
+# ── Infisical vault (loads ANTHROPIC_API_KEY into env) ────────────────────────
+try:
+    _vault_path = os.path.join(os.path.expanduser("~"), "agentic-fleet-hub", "vault")
+    sys.path.insert(0, _vault_path)
+    from vault import load_secrets as _vault_load
+    _vault_load(["ANTHROPIC_API_KEY"])
+except Exception:
+    pass  # fall back to env vars already set
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-SKILLS_DIR  = os.path.dirname(SCRIPT_DIR)
-HUENIT_DIR  = os.path.join(SKILLS_DIR, "huenit")
-VOICE_DIR   = os.path.join(SKILLS_DIR, "voice")
+HUENIT_DIR  = os.path.join(SCRIPT_DIR, "huenit")
+VOICE_DIR   = os.path.join(SCRIPT_DIR, "voice")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OLLAMA_URL       = "http://localhost:11434/api/generate"
-OLLAMA_MODEL     = "qwen2.5:7b"
+OLLAMA_MODEL     = "MichelRosselli/apertus:8b-instruct-2509-q4_k_m"
 PORT             = os.environ.get("HUENIT_PORT", "/dev/cu.usbserial-310")
 CALIBRATION_FILE = os.path.join(HUENIT_DIR, "calibration.json")
 
@@ -44,38 +56,84 @@ COMMENTARY_INTERVAL = 6
 # Log file
 LOG_FILE = os.path.join(SCRIPT_DIR, "bob_ross.log")
 
+# ── JOB LOCK ──────────────────────────────────────────────────────────────────
+import tempfile, ctypes
+_TMP      = tempfile.gettempdir()
+_LOCK_FILE = os.path.join(_TMP, "robot_ross_running.lock")
+
+def _is_stale_lock(lock_path):
+    """Return True if the lock file belongs to a dead process."""
+    try:
+        with open(lock_path) as f:
+            content = f.read()
+        pid = int([l.split("=")[1] for l in content.splitlines() if l.startswith("pid=")][0])
+    except Exception:
+        return True  # unreadable → stale
+    if sys.platform == "win32":
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return False
+        return True
+    else:
+        try:
+            os.kill(pid, 0)
+            return False
+        except ProcessLookupError:
+            return True
+
+def _acquire_lock(action):
+    if os.path.exists(_LOCK_FILE):
+        if not _is_stale_lock(_LOCK_FILE):
+            print("❌ Another Robot Ross job is already running. Use Ctrl+C to stop it.")
+            sys.exit(1)
+        os.remove(_LOCK_FILE)
+    with open(_LOCK_FILE, "w") as f:
+        f.write(f"pid={os.getpid()}\naction={action}\n")
+
+def _release_lock():
+    try:
+        os.remove(_LOCK_FILE)
+    except OSError:
+        pass
+
 
 def log(event, detail=""):
-    """Append a timestamped log entry."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {event}"
     if detail:
         line += f" — {detail}"
     try:
-        with open(LOG_FILE, "a") as f:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
-        pass  # never let logging break the main flow
+        pass
     print(line)
 
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-stop_flag = threading.Event()
-_draw_proc = None
+stop_flag      = threading.Event()
+_draw_proc     = None
 _draw_proc_lock = threading.Lock()
 
 
 # ── Voice ─────────────────────────────────────────────────────────────────────
+_dual_voice = False
+_tts_engine = "kokoro"   # set from --engine at startup
+
+
 def speak(text):
     """Speak text via speak.py. Blocks until done."""
     if stop_flag.is_set():
         return
     print(f"  🗣  {text}")
+    cmd = [sys.executable, os.path.join(VOICE_DIR, "speak.py"), text,
+           "--engine", _tts_engine]
+    if _dual_voice:
+        cmd.append("--dual")
     try:
-        subprocess.run(
-            ["python3", os.path.join(VOICE_DIR, "speak.py"), text],
-            timeout=90,
-        )
+        subprocess.run(cmd, timeout=120)
     except subprocess.TimeoutExpired:
         print("  ⚠  speak.py timed out")
     except Exception as e:
@@ -84,61 +142,73 @@ def speak(text):
 
 def warning_tone():
     """Three Ping beeps to warn humans to step away."""
-    ping = "/System/Library/Sounds/Ping.aiff"
+    import platform
     for _ in range(3):
         if stop_flag.is_set():
             return
         try:
-            subprocess.run(["afplay", ping], capture_output=True, timeout=3)
+            if platform.system() == "Windows":
+                import winsound
+                winsound.Beep(1000, 200)
+            elif platform.system() == "Darwin":
+                subprocess.run(["afplay", "/System/Library/Sounds/Ping.aiff"],
+                               capture_output=True, timeout=3)
+            else:
+                subprocess.run(["beep"], capture_output=True, timeout=3)
         except Exception:
-            # Fallback: use say with a short beep word
-            subprocess.run(["say", "-v", "Evan", "beep"], capture_output=True, timeout=3)
+            pass
         time.sleep(0.5)
 
 
 # ── Readiness check ───────────────────────────────────────────────────────────
 def readiness_check():
-    """Return a list of issues. Empty list = all good."""
     issues = []
 
     # Robot arm port
-    if not os.path.exists(PORT):
+    _port_ok = False
+    if sys.platform == "win32":
+        try:
+            import serial
+            s = serial.Serial(PORT, 115200, timeout=0.5)
+            s.close()
+            _port_ok = True
+        except Exception:
+            pass
+    else:
+        _port_ok = os.path.exists(PORT)
+    if not _port_ok:
         issues.append(f"Robot arm port not found: {PORT}")
 
     # Calibration file
     if not os.path.exists(CALIBRATION_FILE):
-        issues.append(
-            "No calibration file found. "
-            "Run: python3 ~/.openclaw/workspace/skills/huenit/huenit_draw.py calibrate"
-        )
+        issues.append("No calibration file — run: python bob_ross.py calibrate")
 
-    # Session ready flag (set by calibrate, cleared on reboot)
-    if not os.path.exists("/tmp/huenit_ready.flag"):
-        issues.append(
-            "Robot not calibrated this session. "
-            "Run: python3 ~/.openclaw/workspace/skills/huenit/huenit_draw.py calibrate"
-        )
+    # Session ready flag
+    _ready_flag = os.path.join(_TMP, "huenit_ready.flag")
+    if not os.path.exists(_ready_flag):
+        issues.append("Robot not calibrated this session — run: python bob_ross.py calibrate")
 
-    # Ollama reachable
+    # Ollama reachable + model available
     try:
         req = urllib.request.Request("http://localhost:11434/api/tags")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
             models = [m["name"] for m in data.get("models", [])]
-            if not any(OLLAMA_MODEL.split(":")[0] in m for m in models):
+            model_base = OLLAMA_MODEL.split(":")[0].split("/")[-1].lower()
+            if not any(model_base in m.lower() for m in models):
                 issues.append(
-                    f"Model '{OLLAMA_MODEL}' not found in Ollama. "
+                    f"Model '{OLLAMA_MODEL}' not in Ollama. "
                     f"Available: {', '.join(models) or 'none'}"
                 )
     except Exception as e:
         issues.append(f"Ollama not reachable at localhost:11434 — {e}")
 
-    # Huenit scripts exist
-    for script in ("huenit_write.py", "huenit_draw.py"):
+    # Huenit scripts
+    for script in ("huenit_write.py", "huenit_draw.py", "huenit_svg.py"):
         if not os.path.exists(os.path.join(HUENIT_DIR, script)):
             issues.append(f"Missing huenit script: {script}")
 
-    # Voice script exists
+    # Voice script
     if not os.path.exists(os.path.join(VOICE_DIR, "speak.py")):
         issues.append("Missing voice script: speak.py")
 
@@ -146,31 +216,32 @@ def readiness_check():
 
 
 # ── Ollama narration ──────────────────────────────────────────────────────────
-def generate_narration(action, content):
-    """Ask Qwen to generate Bob Ross style narration. Returns dict or fallback."""
+def generate_narration(action, content, buyer=None):
+    """Ask Apertus to generate Bob Ross style narration. Returns dict or fallback."""
+    buyer_line = (f" The customer's name is {buyer}. Address them warmly by name in the intro."
+                  if buyer else "")
+    speakable = content.replace('\\n', ' ').replace('\n', ' ').strip()
+
     if action == "write":
-        text_lines = content.replace('\\n', '\n').split('\n')
-        text_lines = [l for l in text_lines if l.strip()]
-        if len(text_lines) > 1:
-            action_desc = f"write {len(text_lines)} lines of text: {' / '.join(text_lines)}"
-        else:
-            action_desc = f"write the text '{content}'"
-    elif action == "svg":
-        action_desc = f"draw a vector illustration from the file '{os.path.basename(content)}'"
+        lines = [l for l in speakable.replace('\\n', '\n').split('\n') if l.strip()]
+        action_desc = (f"write {len(lines)} lines of text: {' / '.join(lines)}"
+                       if len(lines) > 1 else f"write the text '{speakable}'")
+    elif action in ("svg", "sketch"):
+        action_desc = f"draw a vector illustration of '{speakable}'"
+    elif action == "pyro":
+        action_desc = f"burn a wood pyrography of '{speakable}'"
     else:
-        action_desc = f"draw a {content}"
+        action_desc = f"draw a {speakable}"
 
     prompt = (
         "You are Bob Ross, the gentle and poetic TV painter. "
         "But today, instead of painting, you are controlling a robot arm that draws on paper.\n\n"
-        f"A request has come in to {action_desc}.\n\n"
+        f"A request has come in to {action_desc}.{buyer_line}\n\n"
         "Generate narration as a JSON object with exactly these keys:\n"
         '- "intro": 1-2 warm sentences welcoming the request. Start with "We got a lovely request..."\n'
         '- "commentary": a list of 5 short, poetic, Bob Ross-style phrases to say WHILE drawing. '
-        "They do not need to match specific letters or shapes — just be encouraging and peaceful. "
         "Each phrase is 1 short sentence.\n"
-        '- "outro": 1-2 warm sentences for when the drawing is done, '
-        "telling the human they can remove their piece.\n\n"
+        '- "outro": 1-2 warm sentences for when the drawing is done.\n\n'
         "Respond with ONLY the JSON object. No explanation, no markdown."
     )
 
@@ -183,25 +254,24 @@ def generate_narration(action, content):
 
     try:
         req = urllib.request.Request(
-            OLLAMA_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+            OLLAMA_URL, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
-            narration = json.loads(result["response"])
-            # Validate expected keys
-            if all(k in narration for k in ("intro", "commentary", "outro")):
-                return narration
-            print("  ⚠  Qwen response missing expected keys, using fallback")
+            raw = json.loads(resp.read()).get("response", "")
+            import re as _re
+            m = _re.search(r'\{.*\}', raw, _re.DOTALL)
+            if m:
+                narration = json.loads(m.group())
+                if all(k in narration for k in ("intro", "commentary", "outro")):
+                    return narration
+            print("  ⚠  Apertus response missing expected keys, using fallback")
     except Exception as e:
         print(f"  ⚠  Ollama error: {e} — using fallback narration")
 
-    # Fallback narration
+    greeting = f"Good morning, {buyer}. " if buyer else ""
     return {
         "intro": (
-            f"We got a lovely request for {content} today. "
+            f"{greeting}We got a lovely request for {speakable} today. "
             "Let's see what happy little marks we can make together."
         ),
         "commentary": [
@@ -220,8 +290,7 @@ def generate_narration(action, content):
 
 # ── Commentary thread ─────────────────────────────────────────────────────────
 def run_commentary(phrases, draw_done):
-    """Fire commentary phrases at intervals while drawing. Runs in background thread."""
-    time.sleep(3)  # give the arm a moment to start
+    time.sleep(3)
     for phrase in phrases:
         if stop_flag.is_set() or draw_done.is_set():
             break
@@ -230,26 +299,29 @@ def run_commentary(phrases, draw_done):
 
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
-def run_draw(action, content, size=None):
-    """
-    Launch the appropriate huenit script as a subprocess.
-    Monitors stop_flag and terminates + lifts pen if set.
-    Returns True on success.
-    """
+def run_draw(action, content, size=None, pyro=False, feed=None):
     global _draw_proc
 
+    pyro_feed = feed or (45 if pyro else None)
+
     if action == "write":
-        cmd = ["python3", os.path.join(HUENIT_DIR, "huenit_write.py"), content]
+        cmd = [sys.executable, os.path.join(HUENIT_DIR, "huenit_write.py"), content]
         if size:
             cmd += ["--size", str(size)]
+        if pyro_feed:
+            cmd += ["--feed", str(pyro_feed)]
     elif action == "draw":
-        cmd = ["python3", os.path.join(HUENIT_DIR, "huenit_draw.py"), content]
+        cmd = [sys.executable, os.path.join(HUENIT_DIR, "huenit_draw.py"), content]
         if size:
             cmd.append(str(size))
-    elif action == "svg":
-        cmd = ["python3", os.path.join(HUENIT_DIR, "huenit_svg.py"), content]
+    elif action in ("svg", "sketch"):
+        cmd = [sys.executable, os.path.join(HUENIT_DIR, "huenit_svg.py"), content]
         if size:
             cmd += ["--size", str(size)]
+        if pyro_feed:
+            cmd += ["--feed", str(pyro_feed)]
+        if pyro:
+            cmd.append("--pyro")
     else:
         print(f"  ⚠  Unknown action: {action}")
         return False
@@ -270,15 +342,12 @@ def run_draw(action, content, size=None):
 
 
 def _emergency_stop():
-    """Terminate the draw process and lift the pen."""
     global _draw_proc
     with _draw_proc_lock:
         proc = _draw_proc
     if proc and proc.poll() is None:
         proc.terminate()
         proc.wait(timeout=3)
-
-    # Lift pen via raw serial
     try:
         import serial
         s = serial.Serial(PORT, 115200, timeout=1)
@@ -294,7 +363,6 @@ def _emergency_stop():
         print(f"  ⚠  Could not lift pen via serial: {e}")
 
 
-# ── Signal handler ────────────────────────────────────────────────────────────
 def handle_stop(signum, frame):
     log("STOP", "signal received — aborting job")
     stop_flag.set()
@@ -302,45 +370,52 @@ def handle_stop(signum, frame):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Robot Ross mode for the Huenit robot arm")
-    parser.add_argument(
-        "action",
-        choices=["write", "draw", "svg", "check", "calibrate"],
-        help="write TEXT | draw SHAPE | svg FILE | check (readiness only) | calibrate",
-    )
-    parser.add_argument(
-        "content",
-        nargs="?",
-        help="Text to write, shape name, or path to SVG file",
-    )
-    parser.add_argument("--size", type=float, help="Size in mm (letter height or shape size)")
+    parser = argparse.ArgumentParser(description="Robot Ross — Huenit arm drawing with Bob Ross narration")
+    parser.add_argument("action",
+        choices=["write", "draw", "svg", "sketch", "check", "calibrate"],
+        help="write TEXT | draw SHAPE | svg FILE | sketch SUBJECT | check | calibrate")
+    parser.add_argument("content", nargs="?",
+        help="Text to write, shape name, SVG path, or sketch subject")
+    parser.add_argument("--size",     type=float, default=80, help="Size in mm (default 80)")
+    parser.add_argument("--feed",     type=float, default=None, help="Feed rate mm/min")
+    parser.add_argument("--buyer",    default=None, help="Visitor/buyer name for personalised narration")
+    parser.add_argument("--pyro",     action="store_true", help="Pyrography mode (slow feed for wood burning)")
+    parser.add_argument("--engine",   default="kokoro", choices=["kokoro", "voxtral", "system"],
+                        help="TTS engine (default: kokoro)")
     parser.add_argument("--no-voice", action="store_true", help="Skip all voice narration")
+    parser.add_argument("--dry-run",  action="store_true", help="Narrate without moving the arm")
+    parser.add_argument("--direct",   action="store_true", help="Skip preview, draw immediately")
+    parser.add_argument("--calibrate-before", action="store_true",
+                        help="Run calibration step before drawing")
     args = parser.parse_args()
 
-    signal.signal(signal.SIGINT, handle_stop)
+    global _tts_engine
+    _tts_engine = args.engine
+
+    signal.signal(signal.SIGINT,  handle_stop)
     signal.signal(signal.SIGTERM, handle_stop)
 
-    # ── READINESS CHECK ───────────────────────────────────────────────────────
-    print("[robot-ross] Checking system readiness...")
-    issues = readiness_check()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+    # ── CALIBRATE ─────────────────────────────────────────────────────────────
     if args.action == "calibrate":
         log("CALIBRATE", "starting interactive calibration")
-        subprocess.run(["python3", os.path.join(HUENIT_DIR, "huenit_draw.py"), "calibrate"])
+        subprocess.run([sys.executable,
+                        os.path.join(HUENIT_DIR, "huenit_draw.py"), "calibrate"])
         log("CALIBRATE", "calibration complete")
         sys.exit(0)
 
+    # ── CHECK ─────────────────────────────────────────────────────────────────
+    issues = readiness_check() if not args.dry_run else []
     if args.action == "check":
         if issues:
-            log("CHECK", f"not ready — {'; '.join(issues)}")
             print("❌ System not ready:")
             for issue in issues:
                 print(f"  · {issue}")
             sys.exit(1)
-        else:
-            log("CHECK", "all systems ready")
-            print("✅ All systems ready.")
-            sys.exit(0)
+        print("✅ All systems ready.")
+        sys.exit(0)
 
     if issues:
         log("ERROR", f"readiness check failed — {'; '.join(issues)}")
@@ -350,28 +425,52 @@ def main():
         sys.exit(1)
 
     if not args.content:
-        parser.error("content is required for write/draw")
+        parser.error("content is required for this action")
 
-    log("JOB START", f"action={args.action} content={args.content!r}" + (f" size={args.size}" if args.size else ""))
+    # ── LOCK ──────────────────────────────────────────────────────────────────
+    _acquire_lock(args.action)
+    try:
+        _run_job(args)
+    finally:
+        _release_lock()
 
-    # ── GENERATE NARRATION ────────────────────────────────────────────────────
+
+def _run_job(args):
+    action  = args.action
+    content = args.content
+
+    # ── SKETCH: generate SVG first ────────────────────────────────────────────
+    if action == "sketch":
+        log("SKETCH", f"generating SVG for '{content}'")
+        from huenit.quickdraw_compose import compose_scene
+        import tempfile
+        svg_path = os.path.join(tempfile.gettempdir(), "bob_ross_sketch.svg")
+        ok = compose_scene(content, svg_path)
+        if not ok:
+            print("  ⚠  SVG generation failed")
+            sys.exit(1)
+        action  = "svg"
+        content = svg_path
+
+    log("JOB START", f"action={action} content={content!r} size={args.size}")
+
+    # ── NARRATION ─────────────────────────────────────────────────────────────
     if not args.no_voice:
-        log("NARRATION", "requesting from Qwen")
-        narration = generate_narration(args.action, args.content)
+        log("NARRATION", "requesting from Apertus")
+        narration = generate_narration(args.action, args.content, buyer=args.buyer)
         log("NARRATION", "ready" if narration.get("intro") else "using fallback")
     else:
         narration = {"intro": "", "commentary": [], "outro": ""}
-        log("NARRATION", "skipped (--no-voice)")
 
     if stop_flag.is_set():
         return
 
     # ── WARNING TONE ──────────────────────────────────────────────────────────
-    log("WARNING TONE", "playing — stand clear")
-    warning_tone()
+    if not args.dry_run:
+        log("WARNING TONE", "playing — stand clear")
+        warning_tone()
 
     if stop_flag.is_set():
-        log("STOP", "aborted during warning tone")
         return
 
     # ── INTRO ─────────────────────────────────────────────────────────────────
@@ -380,33 +479,36 @@ def main():
         speak(narration["intro"])
 
     if stop_flag.is_set():
-        log("STOP", "aborted during intro")
-        speak("Stopping before we start.")
         return
 
-    # ── DRAW + LIVE COMMENTARY IN PARALLEL ───────────────────────────────────
-    log("DRAW START", f"{args.action} {args.content!r}")
+    # ── DRAW + COMMENTARY ─────────────────────────────────────────────────────
+    log("DRAW START", f"{action} {content!r}")
     draw_start = time.time()
-    draw_done = threading.Event()
+    draw_done  = threading.Event()
 
     if not args.no_voice and narration["commentary"]:
-        t = threading.Thread(
+        threading.Thread(
             target=run_commentary,
             args=(narration["commentary"], draw_done),
             daemon=True,
-        )
-        t.start()
+        ).start()
 
-    success = run_draw(args.action, args.content, args.size)
+    if args.dry_run:
+        log("DRY RUN", "simulating draw — arm movement skipped")
+        time.sleep(20)
+        success = True
+    else:
+        success = run_draw(action, content, args.size, pyro=args.pyro, feed=args.feed)
+
     draw_done.set()
     elapsed = round(time.time() - draw_start, 1)
 
     if stop_flag.is_set():
-        log("STOP", f"arm stopped mid-draw after {elapsed}s")
+        log("STOP", f"arm stopped after {elapsed}s")
         speak("The arm has been stopped. Please check the paper.")
         return
 
-    time.sleep(0.5)  # let any in-flight speech wrap up
+    time.sleep(0.5)
 
     # ── OUTRO ─────────────────────────────────────────────────────────────────
     if not args.no_voice:
@@ -417,8 +519,7 @@ def main():
             log("ERROR", "draw subprocess failed")
             speak("Something went wrong with the arm. Please check the setup and try again.")
 
-    status = "success" if success else "failed"
-    log("JOB END", f"status={status} duration={elapsed}s")
+    log("JOB END", f"status={'success' if success else 'failed'} duration={elapsed}s")
 
 
 if __name__ == "__main__":
