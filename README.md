@@ -23,8 +23,14 @@ Three modes:
 # Core (all platforms)
 pip install pyserial anthropic
 
-# Voice showcase
-pip install openai-whisper sounddevice kokoro soundfile "numpy<2.0" espeakng-loader mistralai
+# Voice showcase — STT
+pip install openai-whisper sounddevice
+
+# Voice showcase — Kokoro TTS (local neural voice)
+pip install kokoro soundfile "numpy<2.0" espeakng-loader
+
+# Voice showcase — Voxtral TTS (Mistral cloud voice, needs MISTRAL_API_KEY)
+pip install mistralai
 
 # Image tracing (optional)
 pip install vtracer pillow pillow-heif
